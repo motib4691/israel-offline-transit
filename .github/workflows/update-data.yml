@@ -62,7 +62,7 @@ jobs:
       - name: Checkout app repository
         uses: actions/checkout@v4
         with:
-          repository: motibollag/app
+          repository: motib4691/israeltransit
           path: app-source
 
       - name: Prepare routing data
