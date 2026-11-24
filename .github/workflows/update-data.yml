@@ -108,13 +108,20 @@ jobs:
                   for row in db.execute(f'PRAGMA table_info("{table}")')
               }
 
-          required_calendar_columns = {
-              "service_id",
-              "sunday", "monday", "tuesday", "wednesday",
-              "thursday", "friday", "saturday",
-              "start_date", "end_date"
-          }
+          def decode_uvarint(buf, pos):
+              result = 0
+              shift = 0
+              while True:
+                  b = buf[pos]
+                  pos += 1
+                  result |= (b & 0x7F) << shift
+                  if b < 0x80:
+                      return result, pos
+                  shift += 7
 
+          required_calendar_columns = {
+              "service_idx", "weekday_mask", "start_date", "end_date"
+          }
           calendar_columns = columns("calendar")
           missing_columns = required_calendar_columns - calendar_columns
           if missing_columns:
@@ -123,21 +130,23 @@ jobs:
                   + ", ".join(sorted(missing_columns))
               )
 
-          trip_columns = columns("trips")
-          if "service_id" not in trip_columns:
-              raise SystemExit("trips is missing service_id")
-
-          weekday_columns = [
-              "monday", "tuesday", "wednesday",
-              "thursday", "friday", "saturday", "sunday"
-          ]
+          if "trips_blob" not in columns("pattern_schedules"):
+              raise SystemExit("pattern_schedules is missing trips_blob")
 
           calendar_rows = db.execute("""
-              SELECT service_id, sunday, monday, tuesday,
-                     wednesday, thursday, friday, saturday,
-                     start_date, end_date
+              SELECT service_idx, weekday_mask, start_date, end_date
               FROM calendar
           """).fetchall()
+
+          added_dates_by_service = {}
+          for row in db.execute("""
+              SELECT service_idx, date, exception_type
+              FROM calendar_dates
+          """):
+              if int(row["exception_type"]) == 1:
+                  added_dates_by_service.setdefault(row["service_idx"], set()).add(
+                      int(row["date"])
+                  )
 
           print(f"Calendar services: {len(calendar_rows):,}")
 
@@ -146,13 +155,13 @@ jobs:
           inactive_services = []
 
           for row in calendar_rows:
-              service_id = row["service_id"]
+              service_idx = row["service_idx"]
 
-              if service_id in seen_ids:
+              if service_idx in seen_ids:
                   errors.append(
-                      f"Duplicate calendar service_id: {service_id}"
+                      f"Duplicate calendar service_idx: {service_idx}"
                   )
-              seen_ids.add(service_id)
+              seen_ids.add(service_idx)
 
               try:
                   start = datetime.strptime(
@@ -163,87 +172,74 @@ jobs:
                   ).date()
               except (ValueError, TypeError):
                   errors.append(
-                      f"Invalid date for service_id {service_id}: "
+                      f"Invalid date for service_idx {service_idx}: "
                       f"{row['start_date']} - {row['end_date']}"
                   )
                   continue
 
               if start > end:
                   errors.append(
-                      f"start_date is after end_date for service_id "
-                      f"{service_id}"
+                      f"start_date is after end_date for service_idx "
+                      f"{service_idx}"
                   )
                   continue
 
-              active_days = []
-              for column in weekday_columns:
-                  value = str(row[column])
-                  if value not in ("0", "1"):
-                      errors.append(
-                          f"Invalid {column} value for service_id "
-                          f"{service_id}: {value}"
-                      )
-                  elif value == "1":
-                      active_days.append(column)
-
-              if not active_days:
-                  inactive_services.append(service_id)
+              mask = int(row["weekday_mask"])
+              if mask < 0 or mask > 127:
+                  errors.append(
+                      f"Invalid weekday_mask for service_idx "
+                      f"{service_idx}: {mask}"
+                  )
                   continue
 
-              active_weekdays = {
-                  "monday": 0,
-                  "tuesday": 1,
-                  "wednesday": 2,
-                  "thursday": 3,
-                  "friday": 4,
-                  "saturday": 5,
-                  "sunday": 6
-              }
-
               active_weekday_numbers = {
-                  active_weekdays[day] for day in active_days
+                  bit for bit in range(7) if (mask & (1 << bit)) != 0
               }
+              has_added_date = bool(added_dates_by_service.get(service_idx))
 
-              current = start
-              has_active_date = False
+              if not active_weekday_numbers and not has_added_date:
+                  inactive_services.append(service_idx)
+                  continue
 
-              while current <= end:
-                  if current.weekday() in active_weekday_numbers:
-                      has_active_date = True
-                      break
-                  current += timedelta(days=1)
+              has_active_date = has_added_date
+              if not has_active_date:
+                  current = start
+                  while current <= end:
+                      if current.weekday() in active_weekday_numbers:
+                          has_active_date = True
+                          break
+                      current += timedelta(days=1)
 
               if not has_active_date:
-                  inactive_services.append(service_id)
+                  inactive_services.append(service_idx)
 
-          missing_services = db.execute("""
-              SELECT DISTINCT t.service_id
-              FROM trips t
-              LEFT JOIN calendar c
-                  ON t.service_id = c.service_id
-              WHERE c.service_id IS NULL
-              LIMIT 100
-          """).fetchall()
+          used_services = set()
+          for row in db.execute(
+              "SELECT trip_count, trips_blob FROM pattern_schedules"
+          ):
+              t_count = int(row["trip_count"])
+              blob = bytes(row["trips_blob"])
+              pos = 0
+              for _ in range(t_count):
+                  _, pos = decode_uvarint(blob, pos)
+                  s_idx, pos = decode_uvarint(blob, pos)
+                  _, pos = decode_uvarint(blob, pos)
+                  _, pos = decode_uvarint(blob, pos)
+                  used_services.add(s_idx)
 
-          missing_count = db.execute("""
-              SELECT COUNT(DISTINCT t.service_id)
-              FROM trips t
-              LEFT JOIN calendar c
-                  ON t.service_id = c.service_id
-              WHERE c.service_id IS NULL
-          """).fetchone()[0]
+          missing_services = sorted(used_services - seen_ids)
 
           print("\nSERVICE VALIDATION REPORT")
 
-          if missing_count:
+          if missing_services:
               print(
-                  f"ERROR: {missing_count:,} service_id values "
-                  "in trips are missing from calendar."
+                  f"ERROR: {len(missing_services):,} service_idx values "
+                  "in pattern_schedules are missing from calendar."
               )
-              for row in missing_services:
-                  print(f"  Missing service_id: {row['service_id']}")
+              for s_idx in missing_services[:100]:
+                  print(f"  Missing service_idx: {s_idx}")
               errors.append(
-                  f"{missing_count} trip service IDs have no calendar entry"
+                  f"{len(missing_services)} trip service IDs have no calendar entry"
               )
           else:
               print("All trip service IDs exist in calendar.")
@@ -253,8 +249,8 @@ jobs:
                   f"\nWARNING: {len(inactive_services):,} services "
                   "have no active date in their date range."
               )
-              for service_id in inactive_services[:30]:
-                  print(f"  Inactive service_id: {service_id}")
+              for s_idx in inactive_services[:30]:
+                  print(f"  Inactive service_idx: {s_idx}")
               if len(inactive_services) > 30:
                   print("  Additional services omitted from this report.")
           else:
@@ -291,10 +287,9 @@ jobs:
               raise SystemExit(f"Integrity check failed: {integrity}")
 
           required = {
-              "agency", "routes", "trips", "stops",
-              "stop_times", "import_metadata",
-              "route_patterns", "route_pattern_stops",
-              "trip_patterns"
+              "agency", "routes", "stops", "calendar", "calendar_dates",
+              "headsigns", "import_metadata", "route_patterns",
+              "route_pattern_stops", "timing_profiles", "pattern_schedules"
           }
 
           tables = {
@@ -315,6 +310,11 @@ jobs:
                   'SELECT COUNT(*) FROM "' + table.replace('"', '""') + '"'
               ).fetchone()[0]
               print(f"{table}: {count:,} rows")
+
+          total_trips = db.execute(
+              "SELECT COALESCE(SUM(trip_count), 0) FROM pattern_schedules"
+          ).fetchone()[0]
+          print(f"encoded_trips_total: {total_trips:,}")
 
           print("\nOPTIMIZED DATABASE SIZE")
           print(f"{path.stat().st_size:,} bytes")
