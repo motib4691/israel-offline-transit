@@ -131,7 +131,7 @@ jobs:
           EOF
 
           cat << 'EOF' > build/map_process.lua
-          node_keys = { "place", "railway", "amenity", "name", "name:he", "name:en" }
+          node_keys = { "place", "railway", "amenity", "shop", "aeroway", "tourism", "name", "name:he", "name:en" }
 
           function init_processing()
           end
@@ -148,10 +148,25 @@ jobs:
               return name_en
           end
 
+          local function emit_poi(kind, label, minzoom, as_centroid)
+              if label == "" then return end
+              if as_centroid then
+                  LayerAsCentroid("places")
+              else
+                  Layer("places", false)
+              end
+              Attribute("kind", kind)
+              Attribute("name", label)
+              MinZoom(minzoom)
+          end
+
           function node_function()
               local place = Find("place")
               local railway = Find("railway")
               local amenity = Find("amenity")
+              local shop = Find("shop")
+              local aeroway = Find("aeroway")
+              local tourism = Find("tourism")
               local label = preferred_name()
 
               if label == "" then
@@ -159,35 +174,31 @@ jobs:
               end
 
               if place == "city" then
-                  Layer("places", false)
-                  Attribute("kind", "city")
-                  Attribute("name", label)
-                  MinZoom(6)
+                  emit_poi("city", label, 6, false)
               elseif place == "town" then
-                  Layer("places", false)
-                  Attribute("kind", "town")
-                  Attribute("name", label)
-                  MinZoom(8)
+                  emit_poi("town", label, 8, false)
               elseif place == "village" then
-                  Layer("places", false)
-                  Attribute("kind", "village")
-                  Attribute("name", label)
-                  MinZoom(10)
+                  emit_poi("village", label, 10, false)
               elseif place == "suburb" or place == "quarter" or place == "neighbourhood" then
-                  Layer("places", false)
-                  Attribute("kind", "neighbourhood")
-                  Attribute("name", label)
-                  MinZoom(12)
+                  emit_poi("neighbourhood", label, 12, false)
               elseif railway == "station" then
-                  Layer("places", false)
-                  Attribute("kind", "train_station")
-                  Attribute("name", label)
-                  MinZoom(11)
+                  emit_poi("train_station", label, 11, false)
+              elseif railway == "tram_stop" then
+                  emit_poi("tram_stop", label, 13, false)
               elseif amenity == "bus_station" then
-                  Layer("places", false)
-                  Attribute("kind", "bus_station")
-                  Attribute("name", label)
-                  MinZoom(12)
+                  emit_poi("bus_station", label, 12, false)
+              elseif amenity == "hospital" then
+                  emit_poi("hospital", label, 12, false)
+              elseif amenity == "university" or amenity == "college" then
+                  emit_poi("university", label, 12, false)
+              elseif shop == "mall" then
+                  emit_poi("mall", label, 13, false)
+              elseif aeroway == "aerodrome" then
+                  emit_poi("airport", label, 10, false)
+              elseif tourism == "museum" then
+                  emit_poi("poi", label, 13, false)
+              elseif amenity == "parking" and Find("park_ride") == "yes" then
+                  emit_poi("parking", label, 13, false)
               end
           end
 
@@ -199,11 +210,39 @@ jobs:
               local boundary = Find("boundary")
               local railway = Find("railway")
               local highway = Find("highway")
+              local amenity = Find("amenity")
+              local shop = Find("shop")
+              local aeroway = Find("aeroway")
+              local tourism = Find("tourism")
+              local label = preferred_name()
+
+              if IsClosed() and label ~= "" then
+                  if amenity == "hospital" then
+                      emit_poi("hospital", label, 12, true)
+                  elseif amenity == "university" or amenity == "college" then
+                      emit_poi("university", label, 12, true)
+                  elseif shop == "mall" then
+                      emit_poi("mall", label, 13, true)
+                  elseif aeroway == "aerodrome" then
+                      emit_poi("airport", label, 10, true)
+                  elseif tourism == "museum" then
+                      emit_poi("poi", label, 13, true)
+                  elseif amenity == "parking" and Find("park_ride") == "yes" then
+                      emit_poi("parking", label, 13, true)
+                  elseif amenity == "bus_station" then
+                      emit_poi("bus_station", label, 12, true)
+                  elseif railway == "station" then
+                      emit_poi("train_station", label, 11, true)
+                  end
+              end
 
               -- Inland water bodies (Kinneret, Dead Sea, reservoirs, pools)
               if (natural == "water" or landuse == "reservoir" or waterway == "riverbank") and IsClosed() then
                   Layer("water", true)
                   Attribute("kind", "water")
+                  if label ~= "" and Area() > 50000 then
+                      Attribute("name", label)
+                  end
                   MinZoom(6)
                   return
               end
@@ -212,11 +251,17 @@ jobs:
               if waterway == "river" or waterway == "canal" then
                   Layer("waterway", false)
                   Attribute("kind", "river")
+                  if label ~= "" then
+                      Attribute("name", label)
+                  end
                   MinZoom(9)
                   return
               elseif waterway == "stream" then
                   Layer("waterway", false)
                   Attribute("kind", "stream")
+                  if label ~= "" then
+                      Attribute("name", label)
+                  end
                   MinZoom(12)
                   return
               end
@@ -230,6 +275,9 @@ jobs:
                           Attribute("kind", "forest")
                       else
                           Attribute("kind", "park")
+                      end
+                      if label ~= "" and area > 30000 then
+                          Attribute("name", label)
                       end
                       if area > 200000 then
                           MinZoom(8)
@@ -273,7 +321,6 @@ jobs:
                       Layer("roads", false)
                       Attribute("kind", kind)
 
-                      local label = preferred_name()
                       if label ~= "" then
                           Attribute("name", label)
                       end
@@ -316,7 +363,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "Generating GraphHopper 8.0 foot routing graph..."
+          echo "Generating lightweight GraphHopper 8.0 foot routing graph (without CH shortcuts)..."
 
           cat << 'EOF' > build/gh-builder/pom.xml
           <project xmlns="http://maven.apache.org/POM/4.0.0"
@@ -356,9 +403,10 @@ jobs:
 
           cat << 'EOF' > build/gh-builder/src/main/java/BuildGraph.java
           import com.graphhopper.GraphHopper;
-          import com.graphhopper.config.CHProfile;
+          import com.graphhopper.GraphHopperConfig;
           import com.graphhopper.config.Profile;
           import com.graphhopper.util.CustomModel;
+          import java.util.Collections;
 
           public class BuildGraph {
               public static void main(String[] args) {
@@ -373,13 +421,14 @@ jobs:
                   footProfile.setWeighting("custom");
                   footProfile.setCustomModel(footModel);
 
-                  GraphHopper hopper = new GraphHopper();
-                  hopper.setOSMFile(osmFile);
-                  hopper.setGraphHopperLocation(graphDir);
-                  hopper.setProfiles(footProfile);
-                  hopper.getCHPreparationHandler().setCHProfiles(
-                      new CHProfile("foot")
-                  );
+                  GraphHopperConfig ghConfig = new GraphHopperConfig()
+                      .putObject("datareader.file", osmFile)
+                      .putObject("graph.location", graphDir)
+                      .putObject("import.osm.ignored_highways", "motorway,trunk")
+                      .putObject("prepare.min_network_size", 400)
+                      .setProfiles(Collections.singletonList(footProfile));
+
+                  GraphHopper hopper = new GraphHopper().init(ghConfig);
                   hopper.importOrLoad();
                   hopper.close();
                   System.out.println("GraphHopper foot graph generated successfully at: " + graphDir);
@@ -396,7 +445,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "Extracting places, streets and house numbers into SQLite..."
+          echo "Extracting places, POIs, streets and normalized addresses into SQLite..."
 
           cat << 'EOF' > build/build_addresses.py
           import sqlite3
@@ -421,29 +470,80 @@ jobs:
                   or ""
               ).strip()
 
+          def classify_poi(tags):
+              place = tags.get("place")
+              if place in PLACE_TYPES or place in SUB_PLACE_TYPES:
+                  return place
+              amenity = tags.get("amenity")
+              if amenity == "hospital":
+                  return "hospital"
+              if amenity in ("university", "college"):
+                  return "university"
+              if amenity == "bus_station":
+                  return "bus_station"
+              if amenity == "parking" and tags.get("park_ride") == "yes":
+                  return "parking"
+              if tags.get("shop") == "mall":
+                  return "mall"
+              if tags.get("aeroway") == "aerodrome":
+                  return "airport"
+              if tags.get("railway") == "station":
+                  return "train_station"
+              if tags.get("tourism") in ("museum", "attraction"):
+                  return "poi"
+              if tags.get("leisure") in ("park", "nature_reserve"):
+                  return "park"
+              return None
+
           class PlaceCollector(osmium.SimpleHandler):
               def __init__(self):
                   super().__init__()
                   self.places = []
                   self.cities = []
                   self.city_grid = {}
+                  self.seen_places = {}
+
+              def _add_place(self, name, kind, lat, lon):
+                  key = (name, kind)
+                  for prev_lat, prev_lon in self.seen_places.get(key, ()):
+                      if abs(lat - prev_lat) < 0.02 and abs(lon - prev_lon) < 0.02:
+                          return
+                  self.seen_places.setdefault(key, []).append((lat, lon))
+                  self.places.append((name, kind, lat, lon))
+                  if kind in PLACE_TYPES:
+                      idx = len(self.cities)
+                      self.cities.append((name, lat, lon))
+                      gkey = (int(lat * 10), int(lon * 10))
+                      self.city_grid.setdefault(gkey, []).append(idx)
 
               def node(self, n):
-                  place = n.tags.get("place")
-                  if not place:
-                      return
-                  if place not in PLACE_TYPES and place not in SUB_PLACE_TYPES:
+                  kind = classify_poi(n.tags)
+                  if not kind:
                       return
                   name = pick_name(n.tags)
                   if not name:
                       return
-                  lat, lon = n.location.lat, n.location.lon
-                  self.places.append((name, place, lat, lon))
-                  if place in PLACE_TYPES:
-                      idx = len(self.cities)
-                      self.cities.append((name, lat, lon))
-                      key = (int(lat * 10), int(lon * 10))
-                      self.city_grid.setdefault(key, []).append(idx)
+                  self._add_place(name, kind, n.location.lat, n.location.lon)
+
+              def area(self, a):
+                  kind = classify_poi(a.tags)
+                  if not kind:
+                      return
+                  name = pick_name(a.tags)
+                  if not name:
+                      return
+                  lats = []
+                  lons = []
+                  for outer in a.outer_rings():
+                      for n in outer:
+                          if n.location.valid():
+                              lats.append(n.lat)
+                              lons.append(n.lon)
+                      if lats:
+                          break
+                  if not lats:
+                      return
+                  self._add_place(name, kind, sum(lats) / len(lats), sum(lons) / len(lons))
 
           def find_nearest_city(lat, lon, cities, city_grid):
               gx, gy = int(lat * 10), int(lon * 10)
@@ -465,7 +565,12 @@ jobs:
                   self.cities = cities
                   self.city_grid = city_grid
                   self.streets_acc = {}
-                  self.addresses = []
+                  self.addresses_map = {}
+
+              def _add_address(self, city, street, housenumber, lat, lon):
+                  key = (city, street, housenumber)
+                  if key not in self.addresses_map:
+                      self.addresses_map[key] = (lat, lon)
 
               def node(self, n):
                   street = (n.tags.get("addr:street") or "").strip()
@@ -475,7 +580,7 @@ jobs:
                       city = (n.tags.get("addr:city") or "").strip()
                       if not city:
                           city = find_nearest_city(lat, lon, self.cities, self.city_grid)
-                      self.addresses.append((city, street, housenumber, lat, lon))
+                      self._add_address(city, street, housenumber, lat, lon)
 
               def way(self, w):
                   highway = w.tags.get("highway")
@@ -516,25 +621,40 @@ jobs:
                       city = (w.tags.get("addr:city") or "").strip()
                       if not city:
                           city = find_nearest_city(avg_lat, avg_lon, self.cities, self.city_grid)
-                      self.addresses.append((city, street_addr, housenumber, avg_lat, avg_lon))
+                      self._add_address(city, street_addr, housenumber, avg_lat, avg_lon)
 
-          print("Pass 1: Collecting places...")
+          print("Pass 1: Collecting places & POIs...")
           place_handler = PlaceCollector()
           place_handler.apply_file(osm_path, locations=True)
-          print(f"Found {len(place_handler.places)} places ({len(place_handler.cities)} cities/towns/villages).")
+          print(f"Found {len(place_handler.places)} places & POIs ({len(place_handler.cities)} cities/towns/villages).")
 
-          print("Pass 2: Collecting streets and addresses...")
+          print("Pass 2: Collecting streets and deduplicated addresses...")
           addr_handler = StreetAndAddressCollector(place_handler.cities, place_handler.city_grid)
           addr_handler.apply_file(osm_path, locations=True)
-          print(f"Found {len(addr_handler.streets_acc)} unique streets and {len(addr_handler.addresses)} addresses.")
+          print(f"Found {len(addr_handler.streets_acc)} unique streets and {len(addr_handler.addresses_map)} unique addresses.")
+
+          street_key_to_id = {}
+          street_rows = []
+          for idx, ((city, street), acc) in enumerate(sorted(addr_handler.streets_acc.items()), start=1):
+              street_key_to_id[(city, street)] = idx
+              street_rows.append((idx, city, street, acc[0] / acc[2], acc[1] / acc[2]))
+
+          address_rows = []
+          for (city, street, housenumber), (lat, lon) in addr_handler.addresses_map.items():
+              s_id = street_key_to_id.get((city, street))
+              if s_id is None:
+                  s_id = len(street_rows) + 1
+                  street_key_to_id[(city, street)] = s_id
+                  street_rows.append((s_id, city, street, lat, lon))
+              address_rows.append((s_id, housenumber, lat, lon))
 
           conn = sqlite3.connect(db_path)
           conn.execute("PRAGMA journal_mode = OFF")
           conn.execute("PRAGMA synchronous = OFF")
+          conn.execute("PRAGMA page_size = 4096")
 
           conn.execute("""
               CREATE TABLE places (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                   name TEXT NOT NULL,
                   kind TEXT NOT NULL,
                   lat REAL NOT NULL,
@@ -544,7 +664,7 @@ jobs:
 
           conn.execute("""
               CREATE TABLE streets (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  street_id INTEGER PRIMARY KEY,
                   city TEXT NOT NULL,
                   street_name TEXT NOT NULL,
                   lat REAL NOT NULL,
@@ -554,9 +674,7 @@ jobs:
 
           conn.execute("""
               CREATE TABLE addresses (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  city TEXT NOT NULL,
-                  street_name TEXT NOT NULL,
+                  street_id INTEGER NOT NULL,
                   house_number TEXT NOT NULL,
                   lat REAL NOT NULL,
                   lon REAL NOT NULL
@@ -568,30 +686,28 @@ jobs:
               place_handler.places
           )
 
-          street_rows = [
-              (city, street, acc[0] / acc[2], acc[1] / acc[2])
-              for (city, street), acc in addr_handler.streets_acc.items()
-          ]
           conn.executemany(
-              "INSERT INTO streets (city, street_name, lat, lon) VALUES (?, ?, ?, ?)",
+              "INSERT INTO streets (street_id, city, street_name, lat, lon) VALUES (?, ?, ?, ?, ?)",
               street_rows
           )
 
           conn.executemany(
-              "INSERT INTO addresses (city, street_name, house_number, lat, lon) VALUES (?, ?, ?, ?, ?)",
-              addr_handler.addresses
+              "INSERT INTO addresses (street_id, house_number, lat, lon) VALUES (?, ?, ?, ?)",
+              address_rows
           )
 
           conn.execute("CREATE INDEX idx_places_name ON places(name)")
+          conn.execute("CREATE INDEX idx_places_lat_lon ON places(lat, lon)")
           conn.execute("CREATE INDEX idx_streets_name ON streets(street_name, city)")
-          conn.execute("CREATE INDEX idx_streets_city ON streets(city, street_name)")
-          conn.execute("CREATE INDEX idx_addresses_lookup ON addresses(street_name, city, house_number)")
+          conn.execute("CREATE INDEX idx_streets_lat_lon ON streets(lat, lon)")
+          conn.execute("CREATE INDEX idx_addresses_lookup ON addresses(street_id, house_number)")
+          conn.execute("CREATE INDEX idx_addresses_lat_lon ON addresses(lat, lon)")
 
           conn.commit()
           conn.execute("ANALYZE")
           conn.execute("VACUUM")
           conn.close()
-          print("Address database built successfully.")
+          print("Compact address database built successfully.")
           EOF
 
           python build/build_addresses.py build/israel.osm.pbf build/map-pack/israel-addresses.sqlite
@@ -628,6 +744,8 @@ jobs:
 
           echo "Individual file sizes before packaging:"
           du -sh "$PMTILES" "$GH_DIR" "$ADDR_DB"
+          echo "GraphHopper internal files:"
+          ls -lh "$GH_DIR"
 
           (cd build/map-pack && zip -r ../israel-map-pack.zip .)
 
