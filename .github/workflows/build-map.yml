@@ -445,11 +445,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "Extracting places, POIs, streets and normalized addresses into SQLite..."
+          echo "Extracting places, boundaries, POIs, streets and normalized addresses into SQLite..."
 
           cat << 'EOF' > build/build_addresses.py
+          import math
           import sqlite3
           import sys
+          from collections import Counter, defaultdict
           import osmium
 
           osm_path = sys.argv[1]
@@ -495,6 +497,20 @@ jobs:
                   return "park"
               return None
 
+          def point_in_ring(lat, lon, ring):
+              inside = False
+              n = len(ring)
+              if n < 3:
+                  return False
+              j = n - 1
+              for i in range(n):
+                  yi, xi = ring[i]
+                  yj, xj = ring[j]
+                  if ((yi > lat) != (yj > lat)) and (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi):
+                      inside = not inside
+                  j = i
+              return inside
+
           class PlaceCollector(osmium.SimpleHandler):
               def __init__(self):
                   super().__init__()
@@ -502,6 +518,7 @@ jobs:
                   self.cities = []
                   self.city_grid = {}
                   self.seen_places = {}
+                  self.boundaries = []
 
               def _add_place(self, name, kind, lat, lon):
                   key = (name, kind)
@@ -512,7 +529,7 @@ jobs:
                   self.places.append((name, kind, lat, lon))
                   if kind in PLACE_TYPES:
                       idx = len(self.cities)
-                      self.cities.append((name, lat, lon))
+                      self.cities.append((name, kind, lat, lon))
                       gkey = (int(lat * 10), int(lon * 10))
                       self.city_grid.setdefault(gkey, []).append(idx)
 
@@ -526,51 +543,104 @@ jobs:
                   self._add_place(name, kind, n.location.lat, n.location.lon)
 
               def area(self, a):
+                  place = a.tags.get("place")
+                  boundary = a.tags.get("boundary")
+                  admin_level = a.tags.get("admin_level")
+                  is_boundary = (place in PLACE_TYPES) or (
+                      boundary == "administrative" and admin_level == "8"
+                  )
                   kind = classify_poi(a.tags)
-                  if not kind:
+                  if not kind and not is_boundary:
                       return
+
                   name = pick_name(a.tags)
                   if not name:
                       return
-                  lats = []
-                  lons = []
-                  for outer in a.outer_rings():
-                      for n in outer:
-                          if n.location.valid():
-                              lats.append(n.lat)
-                              lons.append(n.lon)
-                      if lats:
-                          break
-                  if not lats:
-                      return
-                  self._add_place(name, kind, sum(lats) / len(lats), sum(lons) / len(lons))
 
-          def find_nearest_city(lat, lon, cities, city_grid):
+                  first_lats = None
+                  first_lons = None
+
+                  for outer in a.outer_rings():
+                      outer_pts = [(n.lat, n.lon) for n in outer if n.location.valid()]
+                      if len(outer_pts) < 3:
+                          continue
+                      if first_lats is None:
+                          first_lats = [p[0] for p in outer_pts]
+                          first_lons = [p[1] for p in outer_pts]
+
+                      if is_boundary:
+                          inners = []
+                          for inner in a.inner_rings(outer):
+                              inner_pts = [(n.lat, n.lon) for n in inner if n.location.valid()]
+                              if len(inner_pts) >= 3:
+                                  inners.append(inner_pts)
+
+                          min_lat = min(p[0] for p in outer_pts)
+                          max_lat = max(p[0] for p in outer_pts)
+                          min_lon = min(p[1] for p in outer_pts)
+                          max_lon = max(p[1] for p in outer_pts)
+                          bbox_area = max((max_lat - min_lat) * (max_lon - min_lon), 1e-12)
+                          self.boundaries.append(
+                              (bbox_area, name, min_lat, max_lat, min_lon, max_lon, outer_pts, inners)
+                          )
+                      elif kind:
+                          break
+
+                  if kind and first_lats:
+                      self._add_place(
+                          name, kind, sum(first_lats) / len(first_lats), sum(first_lons) / len(first_lons)
+                      )
+
+          def build_boundary_index(boundaries):
+              # Smallest polygon first so specific towns/local councils match accurately
+              sorted_bounds = sorted(boundaries, key=lambda b: b[0])
+              grid = defaultdict(list)
+              for idx, (_, _, min_lat, max_lat, min_lon, max_lon, _, _) in enumerate(sorted_bounds):
+                  x0 = int(math.floor(min_lat * 20))
+                  x1 = int(math.floor(max_lat * 20))
+                  y0 = int(math.floor(min_lon * 20))
+                  y1 = int(math.floor(max_lon * 20))
+                  for gx in range(x0, x1 + 1):
+                      for gy in range(y0, y1 + 1):
+                          grid[(gx, gy)].append(idx)
+              return sorted_bounds, grid
+
+          def find_boundary_city(lat, lon, sorted_bounds, boundary_grid):
+              gx = int(math.floor(lat * 20))
+              gy = int(math.floor(lon * 20))
+              for idx in boundary_grid.get((gx, gy), ()):
+                  _, name, min_lat, max_lat, min_lon, max_lon, outer_pts, inners = sorted_bounds[idx]
+                  if lat < min_lat or lat > max_lat or lon < min_lon or lon > max_lon:
+                      continue
+                  if point_in_ring(lat, lon, outer_pts):
+                      if not any(point_in_ring(lat, lon, inner) for inner in inners):
+                          return name
+              return ""
+
+          def find_nearest_city_weighted(lat, lon, cities, city_grid):
               gx, gy = int(lat * 10), int(lon * 10)
               best_name = ""
-              best_d2 = 0.04
+              best_score = 0.2
+              weights = {"city": 0.35, "town": 0.65, "village": 1.0}
               for dx in (-2, -1, 0, 1, 2):
                   for dy in (-2, -1, 0, 1, 2):
                       for idx in city_grid.get((gx + dx, gy + dy), ()):
-                          cname, clat, clon = cities[idx]
-                          d2 = (lat - clat) ** 2 + (lon - clon) ** 2
-                          if d2 < best_d2:
-                              best_d2 = d2
+                          cname, kind, clat, clon = cities[idx]
+                          dist = math.hypot(lat - clat, lon - clon)
+                          if dist > 0.2:
+                              continue
+                          score = dist * weights.get(kind, 1.0)
+                          if score < best_score:
+                              best_score = score
                               best_name = cname
               return best_name
 
           class StreetAndAddressCollector(osmium.SimpleHandler):
-              def __init__(self, cities, city_grid):
+              def __init__(self):
                   super().__init__()
-                  self.cities = cities
-                  self.city_grid = city_grid
-                  self.streets_acc = {}
-                  self.addresses_map = {}
-
-              def _add_address(self, city, street, housenumber, lat, lon):
-                  key = (city, street, housenumber)
-                  if key not in self.addresses_map:
-                      self.addresses_map[key] = (lat, lon)
+                  self.raw_streets = []
+                  self.raw_addresses = []
+                  self.street_city_votes = defaultdict(list)
 
               def node(self, n):
                   street = (n.tags.get("addr:street") or "").strip()
@@ -578,9 +648,9 @@ jobs:
                   if street and housenumber:
                       lat, lon = n.location.lat, n.location.lon
                       city = (n.tags.get("addr:city") or "").strip()
-                      if not city:
-                          city = find_nearest_city(lat, lon, self.cities, self.city_grid)
-                      self._add_address(city, street, housenumber, lat, lon)
+                      self.raw_addresses.append((city, street, housenumber, lat, lon))
+                      if city:
+                          self.street_city_votes[street].append((city, lat, lon))
 
               def way(self, w):
                   highway = w.tags.get("highway")
@@ -604,43 +674,96 @@ jobs:
                       name = pick_name(w.tags)
                       if name:
                           city = (w.tags.get("addr:city") or "").strip()
-                          if not city:
-                              city = find_nearest_city(mid_lat, mid_lon, self.cities, self.city_grid)
-                          key = (city, name)
-                          acc = self.streets_acc.get(key)
-                          if acc is None:
-                              self.streets_acc[key] = [mid_lat, mid_lon, 1]
-                          else:
-                              acc[0] += mid_lat
-                              acc[1] += mid_lon
-                              acc[2] += 1
+                          self.raw_streets.append((city, name, mid_lat, mid_lon))
 
                   if street_addr and housenumber:
                       avg_lat = sum(c[0] for c in coords) / len(coords)
                       avg_lon = sum(c[1] for c in coords) / len(coords)
                       city = (w.tags.get("addr:city") or "").strip()
-                      if not city:
-                          city = find_nearest_city(avg_lat, avg_lon, self.cities, self.city_grid)
-                      self._add_address(city, street_addr, housenumber, avg_lat, avg_lon)
+                      self.raw_addresses.append((city, street_addr, housenumber, avg_lat, avg_lon))
+                      if city:
+                          self.street_city_votes[street_addr].append((city, avg_lat, avg_lon))
 
-          print("Pass 1: Collecting places & POIs...")
+          print("Pass 1: Collecting places, POIs & municipal boundaries...")
           place_handler = PlaceCollector()
           place_handler.apply_file(osm_path, locations=True)
-          print(f"Found {len(place_handler.places)} places & POIs ({len(place_handler.cities)} cities/towns/villages).")
+          sorted_bounds, boundary_grid = build_boundary_index(place_handler.boundaries)
+          print(
+              f"Found {len(place_handler.places)} places & POIs, "
+              f"{len(place_handler.cities)} cities/towns/villages, "
+              f"{len(sorted_bounds)} boundary polygons."
+          )
 
-          print("Pass 2: Collecting streets and deduplicated addresses...")
-          addr_handler = StreetAndAddressCollector(place_handler.cities, place_handler.city_grid)
+          print("Pass 2: Collecting streets and addresses...")
+          addr_handler = StreetAndAddressCollector()
           addr_handler.apply_file(osm_path, locations=True)
-          print(f"Found {len(addr_handler.streets_acc)} unique streets and {len(addr_handler.addresses_map)} unique addresses.")
+          print(
+              f"Collected {len(addr_handler.raw_streets)} street segments and "
+              f"{len(addr_handler.raw_addresses)} raw address entries."
+          )
+
+          city_cache = {}
+          def resolve_city(lat, lon, street_name, explicit_city):
+              if explicit_city:
+                  return explicit_city
+              ckey = (round(lat, 4), round(lon, 4), street_name)
+              cached = city_cache.get(ckey)
+              if cached is not None:
+                  return cached
+
+              # 1. Municipal boundary polygon (admin_level=8 or place area)
+              resolved = find_boundary_city(lat, lon, sorted_bounds, boundary_grid)
+
+              # 2. Vote from addr:city on buildings along the same street within ~1.2 km
+              if not resolved and street_name:
+                  votes = Counter()
+                  for v_city, v_lat, v_lon in addr_handler.street_city_votes.get(street_name, ()):
+                      if abs(lat - v_lat) < 0.012 and abs(lon - v_lon) < 0.012:
+                          votes[v_city] += 1
+                  if votes:
+                      resolved = votes.most_common(1)[0][0]
+
+              # 3. Weighted nearest place fallback
+              if not resolved:
+                  resolved = find_nearest_city_weighted(
+                      lat, lon, place_handler.cities, place_handler.city_grid
+                  )
+
+              city_cache[ckey] = resolved
+              return resolved
+
+          streets_acc = {}
+          for explicit_city, name, mid_lat, mid_lon in addr_handler.raw_streets:
+              city = resolve_city(mid_lat, mid_lon, name, explicit_city)
+              key = (city, name)
+              acc = streets_acc.get(key)
+              if acc is None:
+                  streets_acc[key] = [mid_lat, mid_lon, 1]
+              else:
+                  acc[0] += mid_lat
+                  acc[1] += mid_lon
+                  acc[2] += 1
+
+          addresses_map = {}
+          # Insert addresses with explicit addr:city first so they take precedence over inferred ones
+          for explicit_city, street_addr, housenumber, lat, lon in sorted(
+              addr_handler.raw_addresses, key=lambda x: 0 if x[0] else 1
+          ):
+              city = resolve_city(lat, lon, street_addr, explicit_city)
+              akey = (city, street_addr, housenumber)
+              if akey not in addresses_map:
+                  addresses_map[akey] = (lat, lon)
+
+          print(f"Resolved {len(streets_acc)} unique streets and {len(addresses_map)} unique addresses.")
 
           street_key_to_id = {}
           street_rows = []
-          for idx, ((city, street), acc) in enumerate(sorted(addr_handler.streets_acc.items()), start=1):
+          for idx, ((city, street), acc) in enumerate(sorted(streets_acc.items()), start=1):
               street_key_to_id[(city, street)] = idx
               street_rows.append((idx, city, street, acc[0] / acc[2], acc[1] / acc[2]))
 
           address_rows = []
-          for (city, street, housenumber), (lat, lon) in addr_handler.addresses_map.items():
+          for (city, street, housenumber), (lat, lon) in addresses_map.items():
               s_id = street_key_to_id.get((city, street))
               if s_id is None:
                   s_id = len(street_rows) + 1
